@@ -17,6 +17,8 @@ Environment:
 
 Usage:
   ./remote_codex.py --host mybox.example.com --user codex "Install nginx and verify it's running"
+
+This program was mainly written by ChatGPT and Claude.
 """
 
 from __future__ import annotations
@@ -306,8 +308,10 @@ class RealtimeAgent:
 
                 t = evt.get("type", "")
                 if not t:
-                    await self.ui.add_note(f"\n[openai:event] no event\n")
-                if t == "response.output_text.delta":
+                    await self.ui.add_note(f"[openai:event] no event")
+                if t == "response.function_call_arguments.delta":
+                    # Ignored; this is for internal use.
+                elif t == "response.output_text.delta":
                     # The docs identify this as the streaming text delta event.
                     delta = evt.get("delta", "")
                     if delta:
@@ -319,8 +323,8 @@ class RealtimeAgent:
                 elif t == "error":
                     await self.ui.add_note(f"[openai:error] {json.dumps(evt, ensure_ascii=False)}")
                 else:
-                    await self.ui.add_note(f"\n[openai:event] {t}\n")
-                # Ignore other lifecycle events (session.created, response.created, etc.)
+                    # Report other lifecycle events (session.created, response.created, etc.)
+                    await self.ui.add_note(f"[openai:event] {t}")
 
     async def _session_update(self, ws) -> None:
         """
@@ -330,12 +334,13 @@ class RealtimeAgent:
         instructions = (
             "You are operating a remote Linux shell via an SSH session.\n"
             "You MUST use the tool run_remote to execute commands.\n"
-            "Do not suggest commands without running them unless you explicitly cannot.\n"
+            "This is a non-interactive session, there is no user to answer questions.\n"
             "When you have enough information, call finish with:\n"
             "  - summary: 3-8 bullet lines of what you did\n"
             "  - result: 1-3 lines stating the final outcome/state\n"
             "\n"
-            "For the human UI, write short 'working notes' as plain text while you operate.\n"
+            "For logging purposes, write short 'working notes' as plain text while you operate.\n"
+            "You do not have administrative access on the remote host, so calls to sudo will fail.\n"
             # "Do NOT request or reveal hidden chain-of-thought; provide concise operational notes.\n"
             # "Avoid any command that uses ssh/scp/sftp or pivots to another host.\n"
         )
