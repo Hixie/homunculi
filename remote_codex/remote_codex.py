@@ -310,11 +310,19 @@ class RealtimeAgent:
                 if not t:
                     await self.ui.add_note(f"[openai:event] no event")
                 if t == "response.function_call_arguments.delta":
-                    # Ignored
-                if t == "conversation.item.done":
-                    # Ignored
-                if t == "response.output_item.done":
-                    # Ignored
+                    pass # Ignored
+                if t == "response.function_call_arguments.done":
+                    pass # Ignored
+                elif t == "conversation.item.added":
+                    pass # Ignored
+                elif t == "conversation.item.done":
+                    pass # Ignored
+                elif t == "response.content_part.done":
+                    pass # Ignored
+                elif t == "response.output_item.done":
+                    pass # Ignored
+                elif t == "response.output_text.done":
+                    pass # Ignored
                 elif t == "response.output_text.delta":
                     # The docs identify this as the streaming text delta event.
                     delta = evt.get("delta", "")
@@ -573,10 +581,9 @@ async def main_async(argv: list[str]) -> int:
 
     # Print final summary to user (outside curses UI).
     if agent.final_summary:
-        print("\n" + "=" * 80 + "\n" + agent.final_summary)
+        print(agent.final_summary)
         return 0
 
-    print("\n" + "=" * 80)
     print("Session ended without a finish() call from the model.")
     return 2
 
