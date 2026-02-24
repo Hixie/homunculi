@@ -310,7 +310,11 @@ class RealtimeAgent:
                 if not t:
                     await self.ui.add_note(f"[openai:event] no event")
                 if t == "response.function_call_arguments.delta":
-                    # Ignored; this is for internal use.
+                    # Ignored
+                if t == "conversation.item.done":
+                    # Ignored
+                if t == "response.output_item.done":
+                    # Ignored
                 elif t == "response.output_text.delta":
                     # The docs identify this as the streaming text delta event.
                     delta = evt.get("delta", "")
@@ -320,11 +324,13 @@ class RealtimeAgent:
                     await self._handle_response_done(ws, evt)
                     if self._stop_evt.is_set():
                         break
+                elif t.startswith("rate_limits"):
+                    await self.ui.add_note(self._format_rate_limit_event(evt))
                 elif t == "error":
                     await self.ui.add_note(f"[openai:error] {json.dumps(evt, ensure_ascii=False)}")
                 else:
                     # Report other lifecycle events (session.created, response.created, etc.)
-                    await self.ui.add_note(f"[openai:event] {t}")
+                    await self.ui.add_note(f"[openai:event] unknown event: {t}")
 
     async def _session_update(self, ws) -> None:
         """
@@ -477,6 +483,44 @@ class RealtimeAgent:
             },
         }
         await ws.send(json.dumps(event))
+
+    def _format_rate_limit_event(self, evt: dict) -> str:
+        rate_limits = evt.get("rate_limits")
+        if not isinstance(rate_limits, list):
+            return f"[openai:rate_limits] {json.dumps(evt, ensure_ascii=False)}"
+
+        parts = []
+        for entry in rate_limits:
+            if not isinstance(entry, dict):
+                continue
+            scope = entry.get("name") or entry.get("type") or entry.get("scope") or "unknown"
+            limit = entry.get("limit")
+            remaining = entry.get("remaining")
+            reset_seconds = entry.get("reset_seconds")
+            period = entry.get("period") or entry.get("window")
+
+            details = []
+            if remaining is not None and limit is not None:
+                details.append(f"{remaining}/{limit} remaining")
+            elif limit is not None:
+                details.append(f"limit {limit}")
+            if period:
+                details.append(f"window {period}")
+            if reset_seconds is not None:
+                if isinstance(reset_seconds, (int, float)):
+                    details.append(f"reset in {reset_seconds:.2f}s")
+                else:
+                    details.append(f"reset {reset_seconds}")
+
+            if not details:
+                details.append(json.dumps(entry, ensure_ascii=False))
+
+            parts.append(f"{scope}: {', '.join(details)}")
+
+        if not parts:
+            return f"[openai:rate_limits] {json.dumps(evt, ensure_ascii=False)}"
+
+        return "[openai:rate_limits] " + "; ".join(parts)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
