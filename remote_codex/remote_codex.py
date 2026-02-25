@@ -4,7 +4,7 @@ remote_codex.py
 
 Runs a model-driven remote session over SSH, with OpenAI Realtime WebSocket API tool-calling.
 Local process policy: this program must not exec any local program except `ssh`.
-UI: split terminal (curses) with SSH I/O (top, live status) and model notes (bottom).
+UI: split terminal (curses) with SSH I/O (top, live + rate status panels) and model notes (bottom).
 
 Requirements:
   - Python 3.10+
@@ -109,7 +109,7 @@ class SessionLogger:
 class SplitUI:
     """
     Simple curses UI:
-      - Top pane: SSH stream (rolling)
+      - Top pane: SSH stream (rolling) with STATUS and RATE LIMITS panels
       - Bottom pane: model notes stream (rolling)
     """
 
@@ -120,6 +120,7 @@ class SplitUI:
         self._stdscr = None
         self._note_streaming = False
         self._status = "initializing"
+        self._rate_status = "no rate limit data"
 
     async def add_ssh(self, text: str) -> None:
         async with self._lock:
@@ -163,6 +164,13 @@ class SplitUI:
         async with self._lock:
             self._status = sanitized
 
+    async def set_rate_status(self, text: str) -> None:
+        sanitized = (text or "").replace("\n", " ").strip()
+        if not sanitized:
+            sanitized = "no rate limit data"
+        async with self._lock:
+            self._rate_status = sanitized
+
     def _end_note_stream_locked(self) -> None:
         if self._note_streaming:
             self._note_streaming = False
@@ -176,20 +184,27 @@ class SplitUI:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         split = max(3, int(h * 0.65))
+        if split >= h:
+            split = max(0, h - 1)
         top_h = split
         bot_h = h - split
         usable_width = max(1, w - 1)
 
-        # Headers + status line
+        # Headers + status lines
         stdscr.addnstr(0, 0, "== SSH I/O ".ljust(w, "="), usable_width)
         status = self._status or "idle"
         stdscr.addnstr(1, 0, f" STATUS: {status} ".ljust(w), usable_width)
+        has_rate_panel = top_h >= 3
+        if has_rate_panel:
+            rate_status = self._rate_status or "no rate limit data"
+            stdscr.addnstr(2, 0, f" RATE LIMITS: {rate_status} ".ljust(w), usable_width)
         stdscr.addnstr(split, 0, "== MODEL NOTES ".ljust(w, "="), usable_width)
 
-        # Render SSH lines
-        ssh_view_h = max(0, top_h - 2)
+        reserved_rows = 2 + (1 if has_rate_panel else 0)
+        ssh_view_h = max(0, top_h - reserved_rows)
+        ssh_start_row = reserved_rows
         ssh_lines = list(self._ssh_lines)[-ssh_view_h:]
-        for i, line in enumerate(ssh_lines, start=2):
+        for i, line in enumerate(ssh_lines, start=ssh_start_row):
             stdscr.addnstr(i, 0, line, usable_width)
 
         # Render notes
@@ -478,7 +493,7 @@ class RealtimeAgent:
                         if self._stop_evt.is_set():
                             break
                     elif t.startswith("rate_limits"):
-                        await self.ui.add_note(self._format_rate_limit_event(evt))
+                        await self.ui.set_rate_status(self._format_rate_limit_event(evt))
                     elif t == "error":
                         await self.ui.add_note(f"[openai:error] {json.dumps(evt, ensure_ascii=False)}")
                         await self.ui.set_status("model error")
