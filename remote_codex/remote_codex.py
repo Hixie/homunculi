@@ -69,6 +69,7 @@ class SplitUI:
         self._note_lines: Deque[str] = deque(maxlen=2000)
         self._lock = asyncio.Lock()
         self._stdscr = None
+        self._note_streaming = False
 
     async def add_ssh(self, text: str) -> None:
         async with self._lock:
@@ -77,8 +78,39 @@ class SplitUI:
 
     async def add_note(self, text: str) -> None:
         async with self._lock:
+            self._end_note_stream_locked()
+            if not text:
+                return
             for line in text.splitlines():
                 self._note_lines.append(line)
+
+    async def append_note_stream(self, text: str) -> None:
+        if not text:
+            return
+        cleaned = text.replace("\r", "")
+        if not cleaned:
+            return
+        async with self._lock:
+            if not self._note_streaming:
+                self._note_streaming = True
+                if not self._note_lines or self._note_lines[-1] != "":
+                    self._note_lines.append("")
+            if not self._note_lines:
+                self._note_lines.append("")
+            segments = cleaned.split("\n")
+            self._note_lines[-1] += segments[0]
+            for segment in segments[1:]:
+                self._note_lines.append(segment)
+
+    async def end_note_stream(self) -> None:
+        async with self._lock:
+            self._end_note_stream_locked()
+
+    def _end_note_stream_locked(self) -> None:
+        if self._note_streaming:
+            self._note_streaming = False
+            if self._note_lines and self._note_lines[-1] != "":
+                self._note_lines.append("")
 
     def _render(self) -> None:
         stdscr = self._stdscr
@@ -327,8 +359,9 @@ class RealtimeAgent:
                     # The docs identify this as the streaming text delta event.
                     delta = evt.get("delta", "")
                     if delta:
-                        await self.ui.add_note(delta)
+                        await self.ui.append_note_stream(delta)
                 elif t == "response.done":
+                    await self.ui.end_note_stream()
                     await self._handle_response_done(ws, evt)
                     if self._stop_evt.is_set():
                         break
