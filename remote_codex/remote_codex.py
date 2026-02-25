@@ -377,11 +377,13 @@ class RealtimeAgent:
                     await self.ui.add_note(f"[openai:event] no event")
                 if t == "response.function_call_arguments.delta":
                     pass # Ignored
-                if t == "response.function_call_arguments.done":
+                elif t == "response.function_call_arguments.done":
                     pass # Ignored
                 elif t == "conversation.item.added":
                     pass # Ignored
                 elif t == "conversation.item.done":
+                    pass # Ignored
+                elif t == "response.created":
                     pass # Ignored
                 elif t == "response.content_part.done":
                     pass # Ignored
