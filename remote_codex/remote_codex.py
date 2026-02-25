@@ -422,6 +422,7 @@ class RealtimeAgent:
       - sends initial user prompt
       - listens for tool calls in `response.done` outputs (function_call items)
       - streams output_text deltas to the "notes" pane (by convention)
+      - detects idle responses (no tool usage / finish) and prompts the model to continue, logging the reminder in model notes
     """
 
     def __init__(self, prompt: str, ssh: SSHSession, ui: SplitUI, model: str, logger: Optional[SessionLogger] = None) -> None:
@@ -434,6 +435,8 @@ class RealtimeAgent:
         self.final_summary: Optional[str] = None
         self._stop_evt = asyncio.Event()
         self._model_streaming = False
+        self._current_response_text = ""
+        self._consecutive_idle_responses = 0
 
     @property
     def stop_evt(self) -> asyncio.Event:
@@ -502,6 +505,7 @@ class RealtimeAgent:
                                 self._model_streaming = True
                                 await self.ui.set_status("model responding")
                             await self.ui.append_note_stream(delta)
+                            self._current_response_text += delta
                             if self.logger:
                                 await self.logger.log_model_message(delta)
                     elif t == "response.done":
@@ -623,6 +627,10 @@ class RealtimeAgent:
         resp = evt.get("response", {}) or {}
         output = resp.get("output", []) or []
 
+        last_response_text = self._current_response_text.strip()
+        self._current_response_text = ""
+        handled_tool_call = False
+
         # Also capture any final assistant text (if present as message output items).
         # For simplicity, we rely on output_text.delta streaming for notes and on `finish` to end.
 
@@ -637,6 +645,7 @@ class RealtimeAgent:
                     args = {}
 
                 if name == "run_remote":
+                    handled_tool_call = True
                     cmd = str(args.get("command", ""))
                     timeout_s = int(args.get("timeout_s", 120))
                     cmd_label = self._summarize_command(cmd)
@@ -655,6 +664,7 @@ class RealtimeAgent:
                     await self.ui.set_status("waiting for model")
 
                 elif name == "finish":
+                    handled_tool_call = True
                     summary = str(args.get("summary", "")).strip()
                     result = str(args.get("result", "")).strip()
                     await self.ui.set_status("session complete")
@@ -673,8 +683,39 @@ class RealtimeAgent:
                     await self._create_response(ws)
                     await self.ui.set_status("waiting for model")
 
+        if handled_tool_call:
+            self._consecutive_idle_responses = 0
+        elif not self._stop_evt.is_set():
+            self._consecutive_idle_responses += 1
+            await self._prompt_model_to_continue(ws, last_response_text)
+
         if not self._stop_evt.is_set():
             await self.ui.set_status("waiting for model")
+
+    async def _prompt_model_to_continue(self, ws, last_response_text: str) -> None:
+        count = self._consecutive_idle_responses
+        count_note = f" (idle response #{count})" if count else ""
+        await self.ui.add_note(
+            f"[monitor] No run_remote/finish() tool calls detected in the last response; prompting the model to continue{count_note}"
+        )
+        if last_response_text:
+            excerpt = textwrap.shorten(last_response_text, width=200, placeholder="…")
+            await self.ui.add_note(f"[monitor] Last response excerpt: {excerpt}")
+        message = (
+            "Please continue executing the steps you described. The previous response did not invoke run_remote or "
+            "finish(). Use run_remote to run shell commands, and call finish() when the task is complete."
+        )
+        event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": message}],
+            },
+        }
+        await ws.send(json.dumps(event))
+        await self._create_response(ws)
+        await self.ui.set_status("prompted model to continue")
 
     async def _send_tool_output(self, ws, call_id: str, output_obj: dict) -> None:
         # Return tool results via conversation.item.create with type=function_call_output.
