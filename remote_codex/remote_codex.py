@@ -16,7 +16,11 @@ Environment:
   - OPENAI_PROJECT_ID (optional)
 
 Usage:
-  ./remote_codex.py --host mybox.example.com --user codex "Install nginx and verify it's running"
+  ./remote_codex.py --host mybox.example.com --user codex [--log-file session.log] "Install nginx and verify it's running"
+
+Logging:
+  - All model messages, SSH commands, and SSH terminal output are written to --log-file
+    (defaults to remote_codex_<host>_<timestamp>.log in the current directory).
 
 This program was mainly written by ChatGPT and Claude.
 """
@@ -55,6 +59,51 @@ class CmdResult:
     exit_code: int
     output: str
     blocked_reason: Optional[str] = None
+
+
+class SessionLogger:
+    """Asynchronous session logger for model messages and SSH activity."""
+
+    def __init__(self, path: str) -> None:
+        expanded = os.path.abspath(os.path.expanduser(path))
+        directory = os.path.dirname(expanded)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
+        self.path = expanded
+        self._file = open(self.path, "a", encoding="utf-8")
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def log_model_message(self, text: str) -> None:
+        await self._log("MODEL", text)
+
+    async def log_ssh_command(self, text: str) -> None:
+        await self._log("SSH_CMD", text)
+
+    async def log_ssh_output(self, text: str) -> None:
+        await self._log("SSH_OUT", text)
+
+    async def _log(self, category: str, text: str) -> None:
+        if self._closed or not text:
+            return
+        normalized = text.replace("\r", "")
+        lines = normalized.splitlines()
+        if not lines:
+            if normalized:
+                lines = [normalized]
+            else:
+                return
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        async with self._lock:
+            for line in lines:
+                self._file.write(f"[{timestamp}] {category}: {line}\n")
+            self._file.flush()
+
+    async def close(self) -> None:
+        async with self._lock:
+            if not self._closed:
+                self._file.close()
+                self._closed = True
 
 
 class SplitUI:
@@ -176,10 +225,11 @@ class SSHSession:
     Local process policy: only spawns `ssh` (no other subprocesses).
     """
 
-    def __init__(self, user: str, host: str, ui: SplitUI) -> None:
+    def __init__(self, user: str, host: str, ui: SplitUI, logger: Optional[SessionLogger] = None) -> None:
         self.user = user
         self.host = host
         self.ui = ui
+        self.logger = logger
         self.master_fd: Optional[int] = None
         self.pid: Optional[int] = None
 
@@ -195,10 +245,6 @@ class SSHSession:
         argv = ["ssh", "-tt", f"{self.user}@{self.host}"]
         env = {
             "HOME": os.environ.get("HOME", ""),
-            # "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            # "USER": os.environ.get("USER", ""),
-            # "LOGNAME": os.environ.get("LOGNAME", ""),
-            # "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", ""),
             "TERM": "dumb",
         }
 
@@ -239,6 +285,8 @@ class SSHSession:
 
         os.write(self.master_fd, wrapped.encode("utf-8", errors="ignore"))
         await self.ui.add_ssh(f"[model->ssh] {command}")
+        if self.logger:
+            await self.logger.log_ssh_command(command)
 
         try:
             return await asyncio.wait_for(fut, timeout=timeout_s)
@@ -266,6 +314,8 @@ class SSHSession:
                 break
 
             chunk = data.decode("utf-8", errors="ignore")
+            if self.logger:
+                await self.logger.log_ssh_output(chunk)
             self._buffer += chunk
             await self.ui.add_ssh(chunk)
 
@@ -341,11 +391,12 @@ class RealtimeAgent:
       - streams output_text deltas to the "notes" pane (by convention)
     """
 
-    def __init__(self, prompt: str, ssh: SSHSession, ui: SplitUI, model: str) -> None:
+    def __init__(self, prompt: str, ssh: SSHSession, ui: SplitUI, model: str, logger: Optional[SessionLogger] = None) -> None:
         self.prompt = prompt
         self.ssh = ssh
         self.ui = ui
         self.model = model
+        self.logger = logger
 
         self.final_summary: Optional[str] = None
         self._stop_evt = asyncio.Event()
@@ -392,33 +443,34 @@ class RealtimeAgent:
                     if not t:
                         await self.ui.add_note(f"[openai:event] no event")
                     if t == "response.function_call_arguments.delta":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.function_call_arguments.done":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "conversation.item.added":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "conversation.item.done":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.created":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.content_part.added":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.content_part.done":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.output_item.done":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.output_item.added":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.output_text.done":
-                        pass # Ignored
+                        pass  # Ignored
                     elif t == "response.output_text.delta":
-                        # The docs identify this as the streaming text delta event.
                         delta = evt.get("delta", "")
                         if delta:
                             if not self._model_streaming:
                                 self._model_streaming = True
                                 await self.ui.set_status("model responding")
                             await self.ui.append_note_stream(delta)
+                            if self.logger:
+                                await self.logger.log_model_message(delta)
                     elif t == "response.done":
                         self._model_streaming = False
                         await self.ui.end_note_stream()
@@ -575,6 +627,11 @@ class RealtimeAgent:
                     await self.ui.set_status("session complete")
                     self.final_summary = f"Summary:\n{summary}\n\nResult:\n{result}\n"
                     await self._send_tool_output(ws, call_id, {"ok": True})
+                    if self.logger:
+                        if summary:
+                            await self.logger.log_model_message(f"[finish.summary]\n{summary}")
+                        if result:
+                            await self.logger.log_model_message(f"[finish.result]\n{result}")
                     self._stop_evt.set()
                     return
 
@@ -651,6 +708,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--host", required=True, help="Remote SSH host")
     p.add_argument("--user", default="codex", help='SSH username (default: "codex")')
     p.add_argument("--model", default=REALTIME_MODEL_DEFAULT, help=f"Realtime model (default: {REALTIME_MODEL_DEFAULT})")
+    p.add_argument("--log-file", help="Path to session log file (default: remote_codex_<host>_<timestamp>.log)")
     p.add_argument("prompt", help="Task prompt for the model")
     return p.parse_args(argv)
 
@@ -658,9 +716,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 async def main_async(argv: list[str]) -> int:
     args = parse_args(argv)
 
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    host_token = re.sub(r"[^A-Za-z0-9._-]", "_", args.host)
+    default_log = f"remote_codex_{host_token}_{timestamp}.log"
+    session_logger = SessionLogger(args.log_file or default_log)
+
     ui = SplitUI()
-    ssh = SSHSession(user=args.user, host=args.host, ui=ui)
-    agent = RealtimeAgent(prompt=args.prompt, ssh=ssh, ui=ui, model=args.model)
+    ssh = SSHSession(user=args.user, host=args.host, ui=ui, logger=session_logger)
+    agent = RealtimeAgent(prompt=args.prompt, ssh=ssh, ui=ui, model=args.model, logger=session_logger)
 
     stop_ui = asyncio.Event()
 
@@ -676,10 +739,10 @@ async def main_async(argv: list[str]) -> int:
         try:
             loop.add_signal_handler(sig, _request_stop, sig.name)
         except NotImplementedError:
-            # Some platforms/contexts don't support add_signal_handler (rare on Linux).
             pass
 
     await ui.set_status(f"connecting to SSH: {args.user}@{args.host}")
+    await ui.add_note(f"[log] session log: {session_logger.path}")
 
     ui_task: Optional[asyncio.Task] = None
     agent_task: Optional[asyncio.Task] = None
@@ -727,12 +790,15 @@ async def main_async(argv: list[str]) -> int:
             except Exception:
                 pass
 
-    # Print final summary to user (outside curses UI).
+        await session_logger.close()
+
     if agent.final_summary:
         print(agent.final_summary)
+        print(f"Session log saved to: {session_logger.path}")
         return 0
 
     print("Session ended without a finish() call from the model.")
+    print(f"Session log saved to: {session_logger.path}")
     return 2
 
 
