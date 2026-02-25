@@ -385,9 +385,13 @@ class RealtimeAgent:
                     pass # Ignored
                 elif t == "response.created":
                     pass # Ignored
+                elif t == "response.content_part.added":
+                    pass # Ignored
                 elif t == "response.content_part.done":
                     pass # Ignored
                 elif t == "response.output_item.done":
+                    pass # Ignored
+                elif t == "response.output_item.added":
                     pass # Ignored
                 elif t == "response.output_text.done":
                     pass # Ignored
