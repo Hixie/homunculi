@@ -277,14 +277,48 @@ class SSHSession:
                     # Provide the "before" text; callers can parse/ignore prompts etc.
                     fut.set_result(CmdResult(ok=(exit_code == 0), exit_code=exit_code, output=before))
 
-    async def stop(self) -> None:
-        if self.pid:
+    async def stop(self, force: bool = False) -> None:
+        pid = self.pid
+        sig = signal.SIGKILL if force else signal.SIGHUP
+
+        if pid:
             try:
-                os.kill(self.pid, signal.SIGHUP)
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
             except Exception:
                 pass
+
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+
         if self._read_task:
             self._read_task.cancel()
+            try:
+                await self._read_task
+            except asyncio.CancelledError:
+                pass
+            self._read_task = None
+
+        if self._pending:
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_result(CmdResult(ok=False, exit_code=255, output="", blocked_reason="SSH session closed"))
+            self._pending.clear()
+
+        if pid:
+            wait_flag = 0 if force else os.WNOHANG
+            try:
+                await asyncio.to_thread(os.waitpid, pid, wait_flag)
+            except ChildProcessError:
+                pass
+            except Exception:
+                pass
+        self.pid = None
 
 
 class RealtimeAgent:
@@ -582,7 +616,6 @@ async def main_async(argv: list[str]) -> int:
 
     stop_ui = asyncio.Event()
 
-    # Ensure signals restore UI + exit cleanly.
     loop = asyncio.get_running_loop()
     def _request_stop(signame: str):
         stop_ui.set()
@@ -594,23 +627,51 @@ async def main_async(argv: list[str]) -> int:
             # Some platforms/contexts don't support add_signal_handler (rare on Linux).
             pass
 
-    await ssh.start()
-
-    ui_task = asyncio.create_task(ui.run(stop_ui))
-    agent_task = asyncio.create_task(agent.run())
-
-    done, pending = await asyncio.wait({agent_task}, return_when=asyncio.FIRST_COMPLETED)
-
-    stop_ui.set()
-    try:
-        await ssh.stop()
-    except Exception:
-        pass
+    ui_task: Optional[asyncio.Task] = None
+    agent_task: Optional[asyncio.Task] = None
+    stop_wait_task: Optional[asyncio.Task] = None
 
     try:
-        await asyncio.wait_for(ui_task, timeout=1.0)
-    except Exception:
-        pass
+        await ssh.start()
+
+        ui_task = asyncio.create_task(ui.run(stop_ui))
+        agent_task = asyncio.create_task(agent.run())
+        stop_wait_task = asyncio.create_task(stop_ui.wait())
+
+        done, _ = await asyncio.wait({agent_task, stop_wait_task}, return_when=asyncio.FIRST_COMPLETED)
+
+        if stop_wait_task in done and agent_task and not agent_task.done():
+            agent_task.cancel()
+    finally:
+        stop_ui.set()
+        agent.stop_evt.set()
+
+        if stop_wait_task:
+            try:
+                await stop_wait_task
+            except asyncio.CancelledError:
+                pass
+
+        try:
+            await ssh.stop(force=True)
+        except Exception:
+            pass
+
+        if agent_task:
+            if not agent_task.done():
+                agent_task.cancel()
+            try:
+                await agent_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        if ui_task:
+            try:
+                await asyncio.wait_for(ui_task, timeout=1.0)
+            except Exception:
+                pass
 
     # Print final summary to user (outside curses UI).
     if agent.final_summary:
