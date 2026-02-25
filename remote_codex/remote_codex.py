@@ -4,7 +4,7 @@ remote_codex.py
 
 Runs a model-driven remote session over SSH, with OpenAI Realtime WebSocket API tool-calling.
 Local process policy: this program must not exec any local program except `ssh`.
-UI: split terminal (curses) with SSH I/O (top) and model notes (bottom).
+UI: split terminal (curses) with SSH I/O (top, live status) and model notes (bottom).
 
 Requirements:
   - Python 3.10+
@@ -70,6 +70,7 @@ class SplitUI:
         self._lock = asyncio.Lock()
         self._stdscr = None
         self._note_streaming = False
+        self._status = "initializing"
 
     async def add_ssh(self, text: str) -> None:
         async with self._lock:
@@ -106,6 +107,13 @@ class SplitUI:
         async with self._lock:
             self._end_note_stream_locked()
 
+    async def set_status(self, text: str) -> None:
+        sanitized = (text or "").replace("\n", " ").strip()
+        if not sanitized:
+            sanitized = "idle"
+        async with self._lock:
+            self._status = sanitized
+
     def _end_note_stream_locked(self) -> None:
         if self._note_streaming:
             self._note_streaming = False
@@ -121,22 +129,25 @@ class SplitUI:
         split = max(3, int(h * 0.65))
         top_h = split
         bot_h = h - split
+        usable_width = max(1, w - 1)
 
-        # Headers
-        stdscr.addnstr(0, 0, " SSH I/O ".ljust(w, "="), w - 1)
-        stdscr.addnstr(split, 0, " MODEL NOTES ".ljust(w, "="), w - 1)
+        # Headers + status line
+        stdscr.addnstr(0, 0, "== SSH I/O ".ljust(w, "="), usable_width)
+        status = self._status or "idle"
+        stdscr.addnstr(1, 0, f" STATUS: {status} ".ljust(w), usable_width)
+        stdscr.addnstr(split, 0, "== MODEL NOTES ".ljust(w, "="), usable_width)
 
         # Render SSH lines
-        ssh_view_h = top_h - 1
+        ssh_view_h = max(0, top_h - 2)
         ssh_lines = list(self._ssh_lines)[-ssh_view_h:]
-        for i, line in enumerate(ssh_lines, start=1):
-            stdscr.addnstr(i, 0, line, w - 1)
+        for i, line in enumerate(ssh_lines, start=2):
+            stdscr.addnstr(i, 0, line, usable_width)
 
         # Render notes
         note_view_h = bot_h - 1
         note_lines = list(self._note_lines)[-note_view_h:]
         for j, line in enumerate(note_lines, start=split + 1):
-            stdscr.addnstr(j, 0, line, w - 1)
+            stdscr.addnstr(j, 0, line, usable_width)
 
         stdscr.refresh()
 
@@ -338,6 +349,7 @@ class RealtimeAgent:
 
         self.final_summary: Optional[str] = None
         self._stop_evt = asyncio.Event()
+        self._model_streaming = False
 
     @property
     def stop_evt(self) -> asyncio.Event:
@@ -361,57 +373,69 @@ class RealtimeAgent:
 
     async def run(self) -> None:
         url = REALTIME_URL.format(model=self.model)
+        await self.ui.set_status("connecting to model")
         await self.ui.add_note(f"[openai] connecting {url}")
 
-        async with websockets.connect(url, extra_headers=self._headers(), ping_interval=20) as ws:
-            await self._wait_for_session_created(ws)
-            await self._session_update(ws)
-            await self._send_user_prompt(ws, self.prompt)
-            await self._create_response(ws)
+        try:
+            async with websockets.connect(url, extra_headers=self._headers(), ping_interval=20) as ws:
+                await self._wait_for_session_created(ws)
+                await self.ui.set_status("configuring model session")
+                await self._session_update(ws)
+                await self._send_user_prompt(ws, self.prompt)
+                await self._create_response(ws)
+                await self.ui.set_status("waiting for model")
 
-            async for raw in ws:
-                evt = json.loads(raw)
+                async for raw in ws:
+                    evt = json.loads(raw)
 
-                t = evt.get("type", "")
-                if not t:
-                    await self.ui.add_note(f"[openai:event] no event")
-                if t == "response.function_call_arguments.delta":
-                    pass # Ignored
-                elif t == "response.function_call_arguments.done":
-                    pass # Ignored
-                elif t == "conversation.item.added":
-                    pass # Ignored
-                elif t == "conversation.item.done":
-                    pass # Ignored
-                elif t == "response.created":
-                    pass # Ignored
-                elif t == "response.content_part.added":
-                    pass # Ignored
-                elif t == "response.content_part.done":
-                    pass # Ignored
-                elif t == "response.output_item.done":
-                    pass # Ignored
-                elif t == "response.output_item.added":
-                    pass # Ignored
-                elif t == "response.output_text.done":
-                    pass # Ignored
-                elif t == "response.output_text.delta":
-                    # The docs identify this as the streaming text delta event.
-                    delta = evt.get("delta", "")
-                    if delta:
-                        await self.ui.append_note_stream(delta)
-                elif t == "response.done":
-                    await self.ui.end_note_stream()
-                    await self._handle_response_done(ws, evt)
-                    if self._stop_evt.is_set():
-                        break
-                elif t.startswith("rate_limits"):
-                    await self.ui.add_note(self._format_rate_limit_event(evt))
-                elif t == "error":
-                    await self.ui.add_note(f"[openai:error] {json.dumps(evt, ensure_ascii=False)}")
-                else:
-                    # Report other lifecycle events (session.created, response.created, etc.)
-                    await self.ui.add_note(f"[openai:event] unknown event: {t}")
+                    t = evt.get("type", "")
+                    if not t:
+                        await self.ui.add_note(f"[openai:event] no event")
+                    if t == "response.function_call_arguments.delta":
+                        pass # Ignored
+                    elif t == "response.function_call_arguments.done":
+                        pass # Ignored
+                    elif t == "conversation.item.added":
+                        pass # Ignored
+                    elif t == "conversation.item.done":
+                        pass # Ignored
+                    elif t == "response.created":
+                        pass # Ignored
+                    elif t == "response.content_part.added":
+                        pass # Ignored
+                    elif t == "response.content_part.done":
+                        pass # Ignored
+                    elif t == "response.output_item.done":
+                        pass # Ignored
+                    elif t == "response.output_item.added":
+                        pass # Ignored
+                    elif t == "response.output_text.done":
+                        pass # Ignored
+                    elif t == "response.output_text.delta":
+                        # The docs identify this as the streaming text delta event.
+                        delta = evt.get("delta", "")
+                        if delta:
+                            if not self._model_streaming:
+                                self._model_streaming = True
+                                await self.ui.set_status("model responding")
+                            await self.ui.append_note_stream(delta)
+                    elif t == "response.done":
+                        self._model_streaming = False
+                        await self.ui.end_note_stream()
+                        await self._handle_response_done(ws, evt)
+                        if self._stop_evt.is_set():
+                            break
+                    elif t.startswith("rate_limits"):
+                        await self.ui.add_note(self._format_rate_limit_event(evt))
+                    elif t == "error":
+                        await self.ui.add_note(f"[openai:error] {json.dumps(evt, ensure_ascii=False)}")
+                        await self.ui.set_status("model error")
+                    else:
+                        # Report other lifecycle events (session.created, response.created, etc.)
+                        await self.ui.add_note(f"[openai:event] unknown event: {t}")
+        finally:
+            if not self._stop_evt.is_set():
+                await self.ui.set_status("model connection closed")
 
     async def _session_update(self, ws) -> None:
         """
@@ -530,8 +554,11 @@ class RealtimeAgent:
                 if name == "run_remote":
                     cmd = str(args.get("command", ""))
                     timeout_s = int(args.get("timeout_s", 120))
+                    cmd_label = self._summarize_command(cmd)
+                    await self.ui.set_status(f"waiting for SSH: {cmd_label}")
                     res = await self.ssh.run_command(cmd, timeout_s=timeout_s)
 
+                    await self.ui.set_status("sending SSH result to model")
                     payload = {
                         "ok": res.ok,
                         "exit_code": res.exit_code,
@@ -540,10 +567,12 @@ class RealtimeAgent:
                     }
                     await self._send_tool_output(ws, call_id, payload)
                     await self._create_response(ws)
+                    await self.ui.set_status("waiting for model")
 
                 elif name == "finish":
                     summary = str(args.get("summary", "")).strip()
                     result = str(args.get("result", "")).strip()
+                    await self.ui.set_status("session complete")
                     self.final_summary = f"Summary:\n{summary}\n\nResult:\n{result}\n"
                     await self._send_tool_output(ws, call_id, {"ok": True})
                     self._stop_evt.set()
@@ -552,6 +581,10 @@ class RealtimeAgent:
                 else:
                     await self._send_tool_output(ws, call_id, {"ok": False, "error": f"Unknown tool: {name}"})
                     await self._create_response(ws)
+                    await self.ui.set_status("waiting for model")
+
+        if not self._stop_evt.is_set():
+            await self.ui.set_status("waiting for model")
 
     async def _send_tool_output(self, ws, call_id: str, output_obj: dict) -> None:
         # Return tool results via conversation.item.create with type=function_call_output.
@@ -603,6 +636,15 @@ class RealtimeAgent:
 
         return "[openai:rate_limits] " + "; ".join(parts)
 
+    def _summarize_command(self, command: str) -> str:
+        text = (command or "").strip()
+        if not text:
+            return "<empty>"
+        first_line = text.splitlines()[0].strip()
+        if len(first_line) > 60:
+            return first_line[:57] + "..."
+        return first_line
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -626,12 +668,18 @@ async def main_async(argv: list[str]) -> int:
     def _request_stop(signame: str):
         stop_ui.set()
         agent.stop_evt.set()
+        try:
+            loop.create_task(ui.set_status(f"stopping ({signame})"))
+        except RuntimeError:
+            pass
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
             loop.add_signal_handler(sig, _request_stop, sig.name)
         except NotImplementedError:
             # Some platforms/contexts don't support add_signal_handler (rare on Linux).
             pass
+
+    await ui.set_status(f"connecting to SSH: {args.user}@{args.host}")
 
     ui_task: Optional[asyncio.Task] = None
     agent_task: Optional[asyncio.Task] = None
