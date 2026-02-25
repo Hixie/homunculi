@@ -41,6 +41,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, Deque
 from collections import deque
+import textwrap
 
 import websockets
 
@@ -177,6 +178,21 @@ class SplitUI:
             if self._note_lines and self._note_lines[-1] != "":
                 self._note_lines.append("")
 
+    def _wrap_lines(self, lines: list[str], width: int) -> list[str]:
+        if width <= 0:
+            return lines
+        wrapped: list[str] = []
+        for line in lines:
+            if not line:
+                wrapped.append("")
+                continue
+            parts = textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False)
+            if not parts:
+                wrapped.append("")
+                continue
+            wrapped.extend(parts)
+        return wrapped
+
     def _render(self) -> None:
         stdscr = self._stdscr
         if stdscr is None:
@@ -203,13 +219,15 @@ class SplitUI:
         reserved_rows = 2 + (1 if has_rate_panel else 0)
         ssh_view_h = max(0, top_h - reserved_rows)
         ssh_start_row = reserved_rows
-        ssh_lines = list(self._ssh_lines)[-ssh_view_h:]
+        ssh_wrapped = self._wrap_lines(list(self._ssh_lines), usable_width)
+        ssh_lines = ssh_wrapped[-ssh_view_h:]
         for i, line in enumerate(ssh_lines, start=ssh_start_row):
             stdscr.addnstr(i, 0, line, usable_width)
 
         # Render notes
         note_view_h = bot_h - 1
-        note_lines = list(self._note_lines)[-note_view_h:]
+        note_wrapped = self._wrap_lines(list(self._note_lines), usable_width)
+        note_lines = note_wrapped[-note_view_h:]
         for j, line in enumerate(note_lines, start=split + 1):
             stdscr.addnstr(j, 0, line, usable_width)
 
