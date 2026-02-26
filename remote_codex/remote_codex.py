@@ -437,6 +437,7 @@ class RealtimeAgent:
         self._model_streaming = False
         self._current_response_text = ""
         self._consecutive_idle_responses = 0
+        self._waiting_for_continue_response = False
 
     @property
     def stop_evt(self) -> asyncio.Event:
@@ -501,6 +502,8 @@ class RealtimeAgent:
                     elif t == "response.output_text.delta":
                         delta = evt.get("delta", "")
                         if delta:
+                            if self._waiting_for_continue_response:
+                                self._waiting_for_continue_response = False
                             if not self._model_streaming:
                                 self._model_streaming = True
                                 await self.ui.set_status("model responding")
@@ -646,6 +649,7 @@ class RealtimeAgent:
 
                 if name == "run_remote":
                     handled_tool_call = True
+                    self._waiting_for_continue_response = False
                     cmd = str(args.get("command", ""))
                     timeout_s = int(args.get("timeout_s", 120))
                     cmd_label = self._summarize_command(cmd)
@@ -665,6 +669,7 @@ class RealtimeAgent:
 
                 elif name == "finish":
                     handled_tool_call = True
+                    self._waiting_for_continue_response = False
                     summary = str(args.get("summary", "")).strip()
                     result = str(args.get("result", "")).strip()
                     await self.ui.set_status("session complete")
@@ -687,7 +692,12 @@ class RealtimeAgent:
             self._consecutive_idle_responses = 0
         elif not self._stop_evt.is_set():
             self._consecutive_idle_responses += 1
-            await self._prompt_model_to_continue(ws, last_response_text)
+            if not self._waiting_for_continue_response:
+                await self._prompt_model_to_continue(ws, last_response_text)
+            else:
+                await self.ui.add_note(
+                    "[monitor] Continue prompt already pending; waiting for model response before prompting again"
+                )
 
         if not self._stop_evt.is_set():
             await self.ui.set_status("waiting for model")
@@ -715,6 +725,7 @@ class RealtimeAgent:
         }
         await ws.send(json.dumps(event))
         await self._create_response(ws)
+        self._waiting_for_continue_response = True
         await self.ui.set_status("prompted model to continue")
 
     async def _send_tool_output(self, ws, call_id: str, output_obj: dict) -> None:
