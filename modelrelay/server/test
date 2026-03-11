@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+pkg=$(basename "$dir")
+parent=$(dirname "$dir")
+cd "$parent"
+
+all_modules=(
+  "$pkg".tests.unit.test_protocol
+  "$pkg".tests.unit.test_command_bus
+  "$pkg".tests.unit.test_tool_registry
+  "$pkg".tests.unit.test_tool_read
+  "$pkg".tests.unit.test_tool_replace
+  "$pkg".tests.unit.test_tool_stat
+  "$pkg".tests.unit.test_tool_search
+  "$pkg".tests.unit.test_tool_insert
+  "$pkg".tests.unit.test_usage_tracker
+  "$pkg".tests.unit.test_logger
+  "$pkg".tests.unit.test_cli
+  "$pkg".tests.unit.test_system_prompt
+  "$pkg".tests.unit.test_stdio_layer
+  "$pkg".tests.unit.test_build_backend
+  "$pkg".tests.backend.test_mock_backend
+  "$pkg".tests.backend.test_schema_translation
+  "$pkg".tests.backend.test_anthropic_sse_parsing
+  "$pkg".tests.backend.test_openai_event_parsing
+  "$pkg".tests.backend.test_openai_realtime_backend
+  "$pkg".tests.backend.test_anthropic_backend
+  "$pkg".tests.integration.test_full_session
+  "$pkg".tests.integration.test_tool_roundtrip
+  "$pkg".tests.integration.test_stat_and_search
+  "$pkg".tests.integration.test_insert_flow
+  "$pkg".tests.integration.test_invalidate_flow
+  "$pkg".tests.integration.test_quit_flow
+)
+
+exec python3 -m unittest "${all_modules[@]}" "$@"
